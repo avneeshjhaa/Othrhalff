@@ -237,9 +237,20 @@ export async function submitPcoSongRequest(
 ): Promise<{ success: boolean; data?: PcoSongRequest; error?: string }> {
   // 1. Try server-side API endpoint first (handles auth, UUID normalization, and bypasses RLS restrictions)
   try {
+    // /api/pco-request requires a verified Supabase JWT; requester_id is
+    // derived server-side from auth.uid(). Without a session the endpoint
+    // 401s and we fall through to the direct client insert below.
+    let accessToken: string | null = null;
+    try {
+      const { data } = await supabase.auth.getSession();
+      accessToken = data?.session?.access_token ?? null;
+    } catch { /* no session — fall through to direct insert */ }
     const res = await fetch('/api/pco-request', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      },
       body: JSON.stringify({ track, currentUser, displayName })
     });
     if (res.ok) {

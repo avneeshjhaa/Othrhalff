@@ -1,10 +1,23 @@
 import { MatchProfile } from "../types";
+import { supabase } from "../lib/supabase";
 
 /**
  * Gemini AI Service (Secured)
  * All generative AI calls are proxied through the server-side /api/ai route.
  * The Gemini API key remains strictly server-side and is never exposed in browser bundles.
  */
+
+// The /api/ai route requires a verified Supabase JWT. Without a session the
+// request 401s and the caller falls back to canned text below.
+const getAuthHeader = async (): Promise<Record<string, string>> => {
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+};
 
 export const generateIceBreaker = async (
   myInterests: string[],
@@ -13,7 +26,7 @@ export const generateIceBreaker = async (
   try {
     const res = await fetch('/api/ai', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(await getAuthHeader()) },
       body: JSON.stringify({
         type: 'icebreaker',
         myInterests,
@@ -44,7 +57,7 @@ export const checkCompatibility = async (
   try {
     const res = await fetch('/api/ai', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(await getAuthHeader()) },
       body: JSON.stringify({
         type: 'compatibility',
         myInterests,

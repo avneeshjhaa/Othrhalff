@@ -334,7 +334,13 @@ export const Matches: React.FC = () => {
     // Tier 3: Dedicated Server API Endpoint Fallback
     if (mappedChats === null) {
       try {
-        const res = await fetch(`/api/matches?userId=${encodeURIComponent(currentUser.id)}`);
+        // /api/matches requires a verified Supabase JWT. The API no longer
+        // returns partner realName or dob — the UI falls back to anonymousId.
+        const { data: sessionData } = await supabase.auth.getSession();
+        const accessToken = sessionData?.session?.access_token;
+        const res = await fetch(`/api/matches?userId=${encodeURIComponent(currentUser.id)}`, {
+          headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+        });
         if (res.ok) {
           const apiJson = await res.json();
           if (apiJson?.success && Array.isArray(apiJson.matches)) {

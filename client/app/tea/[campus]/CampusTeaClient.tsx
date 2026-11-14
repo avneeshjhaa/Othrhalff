@@ -352,7 +352,7 @@ export default function CampusTeaClient({ campusSlug }: Props) {
             Have secrets to spill about {campus.name}?
           </h3>
           <p className="text-xs text-gray-400 mb-4 max-w-md mx-auto">
-            Share what everyone is whispering about. 100% anonymous, untraceable, and protected by end-to-end encryption.
+            Share what everyone is whispering about. Posts appear without your name, and your connection is encrypted in transit.
           </p>
           <Link
             href="/confessions"

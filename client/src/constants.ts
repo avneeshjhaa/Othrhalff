@@ -184,7 +184,7 @@ export const MOCK_NOTIFICATIONS: Notification[] = [
   {
     id: 'n3',
     title: "New Feature",
-    message: "Video calls are now end-to-end encrypted for your safety.",
+    message: "Video calls are now encrypted in transit for your safety.",
     timestamp: Date.now() - 1000 * 60 * 60 * 48,
     read: true,
     type: 'system'

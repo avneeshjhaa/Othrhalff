@@ -31,7 +31,15 @@ interface GlimpseReaction {
 
 interface Glimpse {
   id: string;
-  user_id: string;
+  // ANONYMITY: user_id is intentionally NOT selected for the feed — the
+  // author UUID plus the joined profile (real_name / username / avatar)
+  // previously de-anonymised anonymous glimpses. Only the profile's
+  // anonymous_id is fetched, for every glimpse (anonymous or not), so no
+  // real identity ever reaches the client from this query. The viewer's own
+  // posts are recognised via profiles.anonymous_id matching
+  // currentUser.anonymousId where needed; there is no own-post management
+  // (edit/delete) in this feed that needs the raw user_id.
+  user_id?: string;
   image_path: string;
   caption: string | null;
   university: string;
@@ -40,7 +48,7 @@ interface Glimpse {
   location_tag?: string | null;
   media_url?: string | null;
   media_type?: string | null;
-  profiles: GlimpseProfile | null;
+  profiles: { anonymous_id: string } | null;
   glimpse_reactions: GlimpseReaction[];
 }
 
@@ -340,20 +348,13 @@ export const Sparx: React.FC = () => {
         .from('glimpses')
         .select(`
           id,
-          user_id,
           image_path,
           caption,
           university,
           created_at,
           is_anonymous,
           profiles:user_id (
-            id,
-            real_name,
-            username,
-            anonymous_id,
-            avatar,
-            is_verified,
-            university
+            anonymous_id
           ),
           glimpse_reactions (
             id,
@@ -404,20 +405,13 @@ export const Sparx: React.FC = () => {
         .from('glimpses')
         .select(`
           id,
-          user_id,
           image_path,
           caption,
           university,
           created_at,
           is_anonymous,
           profiles:user_id (
-            id,
-            real_name,
-            username,
-            anonymous_id,
-            avatar,
-            is_verified,
-            university
+            anonymous_id
           ),
           glimpse_reactions (
             id,
@@ -478,72 +472,18 @@ export const Sparx: React.FC = () => {
     }
   }, [feedMode, currentUser]);
 
-  // Real-time listener for glimpses and reactions
+  // Polling refresh for glimpses and reactions.
+  // SECURITY: the previous postgres_changes subscriptions on `glimpses`
+  // and `glimpse_reactions` delivered full rows (including author/reactor
+  // user_id) to every subscribed client. They are removed; the feed is
+  // refetched every 30s instead. A server-side public view / RLS fix is
+  // still needed so the feed query itself cannot return user_id at all.
   useEffect(() => {
     if (!supabase) return;
-
-    const glimpseChannel = supabase.channel('glimpses-realtime-feed')
-      // Listen for new glimpses
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'glimpses' }, (payload) => {
-        const newGlimpse = payload.new;
-        
-        // If it's the current user's own upload, ignore
-        if (newGlimpse.user_id === currentUser?.id) return;
-        
-        // Check if the new glimpse matches the university filter criteria
-        const targetUniv = currentUser?.university?.trim();
-        const glimpseUniv = newGlimpse.university?.trim();
-        const matchesCampus = targetUniv && glimpseUniv && glimpseUniv.toLowerCase().startsWith(targetUniv.toLowerCase());
-        
-        if (feedMode === 'campus') {
-          if (matchesCampus) setNewGlimpsesAlert(true);
-        } else {
-          if (!matchesCampus) setNewGlimpsesAlert(true);
-        }
-      })
-      // Listen for updates on reactions in memory with index-targeted shallow updates
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'glimpse_reactions' }, (payload) => {
-        const newReaction = payload.new;
-        if (!newReaction?.glimpse_id) return;
-        setGlimpses(prev => {
-          const index = prev.findIndex(g => g.id === newReaction.glimpse_id);
-          if (index === -1) return prev;
-          const target = prev[index];
-          const existsRx = target.glimpse_reactions?.some(
-            (r: any) => r.user_id === newReaction.user_id && r.reaction_type === newReaction.reaction_type
-          );
-          if (existsRx) return prev;
-          const updated = [...prev];
-          updated[index] = {
-            ...target,
-            glimpse_reactions: [
-              ...(target.glimpse_reactions || []),
-              { id: newReaction.id, reaction_type: newReaction.reaction_type, user_id: newReaction.user_id }
-            ]
-          };
-          return updated;
-        });
-      })
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'glimpse_reactions' }, (payload) => {
-        const oldReaction = payload.old;
-        if (!oldReaction?.id) return;
-        setGlimpses(prev => {
-          const index = prev.findIndex(g => (g.glimpse_reactions || []).some((r: any) => r.id === oldReaction.id));
-          if (index === -1) return prev;
-          const target = prev[index];
-          const updated = [...prev];
-          updated[index] = {
-            ...target,
-            glimpse_reactions: (target.glimpse_reactions || []).filter((r: any) => r.id !== oldReaction.id)
-          };
-          return updated;
-        });
-      })
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(glimpseChannel);
-    };
+    const interval = window.setInterval(() => {
+      if (!document.hidden) fetchGlimpses(false);
+    }, 30000);
+    return () => window.clearInterval(interval);
   }, [feedMode, currentUser]);
 
   const renderLiveRoomsTray = () => {
@@ -953,10 +893,12 @@ export const Sparx: React.FC = () => {
               <div className="max-w-xl mx-auto bg-black">
                 {glimpses.map((glimpse, index) => {
                   const isViewed = viewedIds.includes(glimpse.id);
-                  const isAnon = !!glimpse.is_anonymous;
-                  const displayName = isAnon
-                    ? (glimpse.profiles?.anonymous_id || 'Anonymous Student')
-                    : (glimpse.profiles?.real_name || glimpse.profiles?.username || glimpse.profiles?.anonymous_id || 'Campus Student');
+                  // ANONYMITY: only the anonymous label is ever displayed.
+                  // The feed query no longer fetches real_name / username /
+                  // avatar / is_verified, so non-anonymous glimpses also
+                  // show just the anonymous label until the server provides
+                  // a safe public-profile view for identified posts.
+                  const displayName = glimpse.profiles?.anonymous_id || 'Anonymous Student';
                   const timeText = (() => {
                     const diff = Date.now() - new Date(glimpse.created_at).getTime();
                     const hrs = Math.floor(diff / (1000 * 60 * 60));
@@ -982,19 +924,10 @@ export const Sparx: React.FC = () => {
                           {/* User Avatar */}
                           <div className="relative flex-shrink-0">
                             <div className="w-12 h-12 rounded-full border border-gray-800 overflow-hidden bg-gray-950 flex items-center justify-center">
-                              {!isAnon && glimpse.profiles?.avatar ? (
-                                <img 
-                                  src={getOptimizedUrl(glimpse.profiles.avatar, 64)} 
-                                  alt="Avatar" 
-                                  className="w-full h-full object-cover" 
-                                  referrerPolicy="no-referrer"
-                                  onError={handleImageError}
-                                />
-                              ) : (
-                                <div className="w-full h-full bg-gradient-to-br from-pink-500/20 to-purple-600/20 text-neon text-xs font-bold font-mono flex items-center justify-center">
-                                  {isAnon ? '👻' : (displayName || '??').slice(0, 2).toUpperCase()}
-                                </div>
-                              )}
+                              {/* ANONYMITY: ghost placeholder for every glimpse — the feed no longer fetches author avatars. */}
+                              <div className="w-full h-full bg-gradient-to-br from-pink-500/20 to-purple-600/20 text-neon text-xs font-bold font-mono flex items-center justify-center">
+                                {'👻'}
+                              </div>
                             </div>
                             {!isViewed && (
                               <div className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 bg-rose-500 rounded-full border-2 border-black animate-pulse shadow-[0_0_8px_#f43f5e]" />
@@ -1007,9 +940,6 @@ export const Sparx: React.FC = () => {
                               <h3 className="text-sm font-bold text-gray-100 truncate">
                                 {displayName}
                               </h3>
-                              {glimpse.profiles?.is_verified && !isAnon && (
-                                <BadgeCheck className="w-4 h-4 text-[#60a5fa] drop-shadow-[0_0_4px_rgba(96,165,250,0.6)]" fill="currentColor" stroke="black" strokeWidth={1.5} />
-                              )}
                               <span className="text-xs text-gray-500 font-mono">
                                 · {timeText}
                               </span>

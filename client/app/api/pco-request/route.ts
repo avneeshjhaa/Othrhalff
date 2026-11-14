@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import { checkRateLimit } from '../_lib/rateLimit';
+
+export const dynamic = 'force-dynamic';
 
 // Initialize Supabase with available environment variables
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey, {
@@ -17,10 +20,54 @@ const KNOWN_ADMIN_EMAILS = [
   'lachavzo11@gmail.com'
 ];
 
+/**
+ * Verify the caller's Supabase JWT. Returns the authenticated user, or null
+ * when there is no token, the token is invalid/expired, or auth is not
+ * configured. Never trusts a client-supplied user id or an unverified header.
+ */
+async function getAuthenticatedUser(req: NextRequest) {
+  const header = req.headers.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+
+  const authUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+  if (!authUrl || !anonKey) return null;
+
+  const authClient = createClient(authUrl, anonKey, { auth: { persistSession: false } });
+  const { data, error } = await authClient.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user;
+}
+
+function sanitizeStr(input: unknown, maxLen: number, fallback = ''): string {
+  if (typeof input !== 'string') return fallback;
+  return input.replace(/[\r\n]/g, '').trim().substring(0, maxLen) || fallback;
+}
+
 export async function POST(req: NextRequest) {
+  // Rate limiting: max 10 song requests per minute per IP.
+  const rateLimit = checkRateLimit(req, 10, 60, 'pco-request');
+  if (!rateLimit.success) {
+    return NextResponse.json(
+      { success: false, error: 'Too many requests. Please try again later.' },
+      { status: 429, headers: { 'Retry-After': String(rateLimit.resetInSeconds) } }
+    );
+  }
+
   try {
+    // Require a verified Supabase JWT. The caller in pcoAdmin.ts currently
+    // sends no Authorization header — it must be updated to send
+    // `Authorization: Bearer <session.access_token>` or requests will 401.
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return NextResponse.json({ success: false, error: 'Authentication required' }, { status: 401 });
+    }
+
     const body = await req.json();
-    const { track, currentUser, displayName } = body;
+    // NOTE: any client-supplied `currentUser` / requester id is ignored.
+    // requester_id is always the verified auth.uid() below.
+    const { track, displayName } = body;
 
     if (!track || !track.id || !track.song) {
       return NextResponse.json({ success: false, error: 'Invalid track data' }, { status: 400 });
@@ -30,24 +77,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Database service unavailable' }, { status: 503 });
     }
 
-    // Validate if currentUser.id is a standard UUID (prevent 22P02 PostgreSQL error)
-    const isUuid = (id?: string | null): boolean => {
-      if (!id) return false;
-      return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
-    };
-
-    const requesterId = isUuid(currentUser?.id) ? currentUser.id : null;
-    const requesterName = displayName || currentUser?.realName || currentUser?.anonymousId || 'Campus Listener';
+    const requesterId = user.id;
+    const requesterName = sanitizeStr(displayName, 80, 'Campus Listener');
 
     const payload = {
       requester_id: requesterId,
       requester_name: requesterName,
-      track_id: String(track.id),
-      track_name: String(track.song),
-      track_artist: track.singers || 'Unknown Artist',
-      track_image: track.image || null,
-      track_url: track.media_url || null,
-      track_duration: track.duration ? String(track.duration) : '240',
+      track_id: String(track.id).substring(0, 128),
+      track_name: sanitizeStr(track.song, 200, 'Unknown Track'),
+      track_artist: sanitizeStr(track.singers, 200, 'Unknown Artist'),
+      track_image: typeof track.image === 'string' ? track.image.substring(0, 2048) : null,
+      track_url: typeof track.media_url === 'string' ? track.media_url.substring(0, 2048) : null,
+      track_duration: track.duration ? String(track.duration).substring(0, 32) : '240',
       status: 'pending',
       requested_at: new Date().toISOString()
     };
@@ -60,7 +101,7 @@ export async function POST(req: NextRequest) {
 
     if (error) {
       console.warn('[PCO Request API] DB insert error:', error);
-      return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+      return NextResponse.json({ success: false, error: 'Could not submit song request. Please try again later.' }, { status: 500 });
     }
 
     // Attempt to notify admins via notifications table
@@ -76,13 +117,13 @@ export async function POST(req: NextRequest) {
           from_user_id: requesterId,
           type: 'song_request',
           title: '🎵 New Song Request!',
-          message: `${requesterName} requested "${track.song}" by ${track.singers || 'Unknown'}`,
+          message: `${requesterName} requested "${payload.track_name}" by ${payload.track_artist}`,
           action_url: '/sparx/music?room=Campus_PCO_247',
           data: {
             type: 'song_request',
-            track_name: track.song,
-            track_artist: track.singers,
-            track_image: track.image,
+            track_name: payload.track_name,
+            track_artist: payload.track_artist,
+            track_image: payload.track_image,
             requester: requesterName
           },
           read: false,
@@ -121,6 +162,6 @@ export async function POST(req: NextRequest) {
 
   } catch (err: any) {
     console.error('[PCO Request API] Unexpected error:', err);
-    return NextResponse.json({ success: false, error: err.message || 'Internal server error' }, { status: 500 });
+    return NextResponse.json({ success: false, error: 'Internal server error' }, { status: 500 });
   }
 }

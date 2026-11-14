@@ -5,6 +5,7 @@ import { Playground } from '../../src/views/Playground';
 import { PlaygroundLocked } from '../../src/components/PlaygroundLocked';
 import { PLAYGROUND_CONFIG } from '../../src/constants';
 import { useAuth } from '../../src/context/AuthContext';
+import { supabase } from '../../src/lib/supabase';
 import { LiveKitRoom, RoomAudioRenderer } from '@livekit/components-react';
 
 export default function Page() {
@@ -19,10 +20,18 @@ export default function Page() {
     let isMounted = true;
     const fetchToken = async () => {
       try {
-        const identity = currentUser?.id || `anon-${Math.random().toString(36).substring(2, 9)}`;
+        // /api/livekit-token requires a verified Supabase JWT; identity is
+        // derived server-side from auth.uid(), so no identity param is sent.
+        const { data: sessionData } = await supabase.auth.getSession();
+        const accessToken = sessionData?.session?.access_token;
+        if (!accessToken) {
+          console.warn('[LiveKit Token Error]: no active session — voice disabled');
+          return;
+        }
         const name = currentUser?.realName || 'Student';
         const res = await fetch(
-          `/api/livekit-token?room=playground-global-voice&identity=${encodeURIComponent(identity)}&name=${encodeURIComponent(name)}`
+          `/api/livekit-token?room=playground-global-voice&name=${encodeURIComponent(name)}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
         );
         const data = await res.json();
         if (isMounted && data.token) {
