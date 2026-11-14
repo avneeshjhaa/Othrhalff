@@ -1,20 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { GoogleGenAI } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
 import { checkRateLimit } from '../_lib/rateLimit';
 
 export const dynamic = 'force-dynamic';
 
 function getAiClient() {
-  const apiKey =
-    process.env.GEMINI_API_KEY ||
-    process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    '';
+  // Server-only key. NEXT_PUBLIC_/VITE_ fallbacks are deliberately removed:
+  // a public-prefixed key would be bundled into the client and is not a secret.
+  const apiKey = process.env.GEMINI_API_KEY || '';
 
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
     return null;
   }
   return new GoogleGenAI({ apiKey });
+}
+
+/**
+ * Verify the caller's Supabase JWT. Returns the authenticated user, or null
+ * when there is no token, the token is invalid/expired, or auth is not
+ * configured. Never trusts a client-supplied id or an unverified header.
+ */
+async function getAuthenticatedUser(req: NextRequest) {
+  const header = req.headers.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+
+  const authUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+  if (!authUrl || !anonKey) return null;
+
+  const authClient = createClient(authUrl, anonKey, { auth: { persistSession: false } });
+  const { data, error } = await authClient.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user;
 }
 
 function sanitizeText(input: unknown, maxLen = 100): string {
@@ -44,6 +63,15 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    // 2. Require a verified Supabase JWT — this was an unauthenticated free
+    // Gemini proxy. Callers (client/src/services/geminiService.ts) must now
+    // send `Authorization: Bearer <session.access_token>`; unauthenticated
+    // calls get 401 and the client falls back to its canned text.
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+    }
+
     const body = await req.json();
     const { type, myInterests, theirProfile } = body;
 
@@ -54,10 +82,12 @@ export async function POST(req: NextRequest) {
 
     const ai = getAiClient();
     if (!ai) {
-      if (type === 'compatibility') {
-        return NextResponse.json({ text: 'Compatibility analysis is temporarily offline.' });
-      }
-      return NextResponse.json({ text: 'Hey! Looks like we have some common interests.' });
+      // Server-only GEMINI_API_KEY is missing/unset — fail closed with a
+      // generic 503 instead of silently returning canned text as success.
+      return NextResponse.json(
+        { error: 'AI service temporarily unavailable' },
+        { status: 503 }
+      );
     }
 
     if (type === 'icebreaker') {
@@ -98,10 +128,11 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ error: 'Invalid AI request type' }, { status: 400 });
   } catch (error: any) {
+    // Never leak provider error details, and never report failure as HTTP 200.
     console.error('[AI Route Error]:', error);
     return NextResponse.json(
-      { text: "Hey! What's your favorite spot on campus?", error: error.message },
-      { status: 200 }
+      { error: 'AI service temporarily unavailable' },
+      { status: 502 }
     );
   }
 }

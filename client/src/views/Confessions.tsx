@@ -200,15 +200,18 @@ export const Confessions: React.FC = () => {
     const [isLoadingMore, setIsLoadingMore] = useState(false);
     const observerTarget = useRef<HTMLDivElement>(null);
 
-    // Ref for realtime
-    const expandedCommentsRef = useRef(expandedComments);
-    useEffect(() => { expandedCommentsRef.current = expandedComments; }, [expandedComments]);
-
-    // 2. NETWORK SYNC: Fetch fresh data
+    // 2. NETWORK SYNC: Fetch fresh data + periodic polling.
+    // NOTE (security audit #5): the Supabase Realtime postgres_changes
+    // subscriptions previously here were removed. payload.new shipped the
+    // full row — including user_id — to every subscribed client, which
+    // de-anonymised confession and comment authors, and no client-side
+    // filtering can prevent that: the UUID is on the wire the moment the
+    // subscription exists. New posts/comments now reach the UI via the
+    // 30s poll below plus a refetch after the current user posts
+    // (see submitPost / handleCommentSubmit / handleReaction /
+    // handlePollVote). No Realtime subscription of any kind is used here.
     useEffect(() => {
         if (!supabase) return;
-
-        const targetUniv = currentUser ? currentUser.university : null;
 
         const init = async () => {
             setIsRefreshing(true);
@@ -220,71 +223,15 @@ export const Confessions: React.FC = () => {
 
         init();
 
-        // --- Supabase Realtime ---
-        const channel = supabase.channel('confessions-realtime')
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'confessions' }, (payload) => {
-                const p = payload.new as any;
-                if (currentUser && p.user_id === currentUser.id) return; // Ignore own posts
+        // Poll for new confessions / comment counts while the view is mounted.
+        const pollId = window.setInterval(() => {
+            if (document.hidden) return;
+            setPage(0);
+            setHasMore(true);
+            void fetchConfessions(0, true);
+        }, 30000);
 
-                // Realtime filtering based on feedMode
-                if (targetUniv) {
-                    const postUniv = p.university || '';
-                    const isMatch = postUniv.toLowerCase().startsWith(targetUniv.toLowerCase());
-                    if (feedMode === 'campus' && !isMatch) return;
-                    if (feedMode === 'global' && isMatch) return;
-                }
-
-                const isVideo = p.type === 'video' || (p.image_url && /\.(mp4|webm|mov)(\?.*)?$/i.test(p.image_url));
-
-                const newConfession: Confession = {
-                    id: p.id, 
-                    userId: 'Anonymous', 
-                    text: p.text || '', 
-                    imageUrl: isVideo ? undefined : p.image_url,
-                    videoUrl: isVideo ? p.image_url : undefined,
-                    timestamp: new Date(p.created_at).getTime(), 
-                    likes: 0, 
-                    reactions: {}, 
-                    comments: [],
-                    university: p.university, 
-                    type: (isVideo ? 'video' : p.type) as 'text' | 'poll' | 'video', 
-                    pollOptions: [],
-                    userVote: undefined, 
-                    userReaction: undefined
-                };
-                setConfessions(prev => {
-                    const updated = [newConfession, ...prev];
-                    writeCache(feedMode, updated);
-                    return updated;
-                });
-            })
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'confession_comments' }, async (payload) => {
-                const record = payload.new as any;
-                const confessionId = record.confession_id;
-
-                // Skip own comments — already added optimistically in handleCommentSubmit
-                if (currentUser && record.user_id === currentUser.id) return;
-
-                setConfessions(prev => {
-                    const exists = prev.some(c => c.id === confessionId);
-                    if (!exists) return prev;
-                    const updated = prev.map(c => {
-                        if (c.id !== confessionId) return c;
-                        if (expandedCommentsRef.current[confessionId]) {
-                            // Dedup by ID before adding
-                            if (c.comments?.some(com => com.id === record.id)) return c;
-                            const newComment = { id: record.id, userId: 'Anonymous', text: record.text, timestamp: new Date(record.created_at).getTime() };
-                            return { ...c, comments: [...(c.comments || []), newComment] };
-                        }
-                        // Not expanded — just bump the count with a placeholder
-                        return { ...c, comments: [...(c.comments || []), { id: record.id, userId: '', text: '', timestamp: 0 }] };
-                    });
-                    return updated;
-                });
-            })
-            .subscribe();
-
-        return () => { supabase.removeChannel(channel); };
+        return () => { window.clearInterval(pollId); };
     }, [currentUser?.id, currentUser?.university, sortType, feedMode]);
 
 
@@ -592,6 +539,12 @@ export const Confessions: React.FC = () => {
                 return updated;
             });
 
+            // Refetch from the server (replaces the removed Realtime feed):
+            // picks up the confirmed post plus any other new posts/comments.
+            setPage(0);
+            setHasMore(true);
+            await fetchConfessions(0, true);
+
         } catch (err: any) {
             console.error('Post error:', err);
             alert(err?.message || 'Failed to post.');
@@ -657,6 +610,10 @@ export const Confessions: React.FC = () => {
             const activeUserId = authData?.user?.id || currentUser.id;
             await ensureProfileExists(activeUserId, currentUser);
             await supabase.from('poll_votes').insert({ confession_id: confessionId, option_id: optionId, user_id: activeUserId });
+            // Refetch so vote totals (and any new posts/comments) are authoritative.
+            setPage(0);
+            setHasMore(true);
+            await fetchConfessions(0, true);
         } catch (err) { console.error(err); fetchConfessions(0, true); }
     };
 
@@ -687,6 +644,10 @@ export const Confessions: React.FC = () => {
         try {
             if (previousReaction === emoji) { await supabase.from('confession_reactions').delete().eq('confession_id', id).eq('user_id', currentUser.id); }
             else { analytics.confessionReact(emoji); await supabase.from('confession_reactions').upsert({ confession_id: id, user_id: currentUser.id, emoji }, { onConflict: 'confession_id,user_id' }); }
+            // Refetch so reaction totals (and any new posts/comments) are authoritative.
+            setPage(0);
+            setHasMore(true);
+            await fetchConfessions(0, true);
         } catch (err) { console.error(err); }
     };
 
@@ -786,6 +747,30 @@ export const Confessions: React.FC = () => {
         }
     };
 
+    // Refetch one confession's comment thread with public fields only.
+    // NOTE: user_id is deliberately NOT selected — authors are shown via
+    // profiles.anonymous_id. Used when expanding a thread and after the
+    // current user posts a comment (replaces the removed Realtime
+    // confession_comments subscription).
+    const refreshComments = async (id: string) => {
+        const { data } = await supabase!
+            .from('confession_comments').select(`id, text, created_at, profiles(anonymous_id)`).eq('confession_id', id).order('created_at', { ascending: true });
+        if (data) {
+            setConfessions(prev => {
+                const updated = prev.map(c => {
+                    if (c.id !== id) return c;
+                    return {
+                        ...c, comments: data.map((com: any) => ({
+                            id: com.id, userId: com.profiles?.anonymous_id || 'Anonymous', text: com.text, timestamp: new Date(com.created_at).getTime()
+                        }))
+                    };
+                });
+                writeCache(feedMode, updated);
+                return updated;
+            });
+        }
+    };
+
     const toggleComments = async (id: string) => {
         const isExpanding = !expandedComments[id];
         setExpandedComments(prev => ({ ...prev, [id]: isExpanding }));
@@ -793,22 +778,7 @@ export const Confessions: React.FC = () => {
         // But if truncated, we might need to. For now, assume initial load is enough for preview.
         // If we want full thread, we can still fetch.
         if (isExpanding) {
-            const { data } = await supabase!
-                .from('confession_comments').select(`id, text, created_at, user_id, profiles(anonymous_id)`).eq('confession_id', id).order('created_at', { ascending: true });
-            if (data) {
-                setConfessions(prev => {
-                    const updated = prev.map(c => {
-                        if (c.id !== id) return c;
-                        return {
-                            ...c, comments: data.map((com: any) => ({
-                                id: com.id, userId: com.profiles?.anonymous_id || 'Anonymous', text: com.text, timestamp: new Date(com.created_at).getTime()
-                            }))
-                        };
-                    });
-                    writeCache(feedMode, updated);
-                    return updated;
-                });
-            }
+            await refreshComments(id);
         }
     };
 
@@ -853,6 +823,9 @@ export const Confessions: React.FC = () => {
                     return { ...c, comments: c.comments.map(com => com.id === optimisticComment.id ? { ...com, id: inserted.id } : com) };
                 }));
             }
+            // Refetch the thread (replaces the removed Realtime comments
+            // subscription): confirms the new comment and picks up others'.
+            await refreshComments(confessionId);
         } catch (err) { console.error(err); }
     };
     // isAmityStudent restriction removed to support other colleges in campus and global feeds

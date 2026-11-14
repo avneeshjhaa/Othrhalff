@@ -347,10 +347,13 @@ export const GlimpseUploadModal: React.FC<GlimpseUploadModalProps> = ({
       // 1. Compress Image
       const compressedBlob = await compressImage(file);
 
-      // 2. Upload to Storage using the auth user's folder
+      // 2. Upload to Storage under a random key — never the author's user
+      // id (audit finding #4: `${userId}/...` exposed the author UUID in
+      // the public URL). crypto.randomUUID() is the path segment; the
+      // filename itself stays a timestamp so uploads cannot collide.
       const fileExt = 'jpg';
       const fileName = `${Date.now()}.${fileExt}`;
-      const filePath = `${userId}/${fileName}`;
+      const filePath = `${crypto.randomUUID()}/${fileName}`;
 
       const { error: uploadError } = await supabase.storage
         .from('glimpses')

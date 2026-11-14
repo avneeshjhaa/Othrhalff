@@ -42,15 +42,19 @@ export const Discover: React.FC = () => {
   const [activeUsersCount, setActiveUsersCount] = useState<number>(1);
   const [searchTime, setSearchTime] = useState(0);
 
-  // Active call/session details
+  // Active call/session details.
+  // ANONYMITY: partnerName holds ONLY the partner's anonymous label
+  // (anonymousId). No real name, photo/avatar, or university is ever sent
+  // to, or received from, a stranger in Speed Discover — pre-match or
+  // post-match. A real-name reveal after a mutual match would need a
+  // separate server-side, authenticated matches lookup; none exists here,
+  // so the MATCHED screen also shows only the anonymous label.
   const [callInfo, setCallInfo] = useState<{
     appId: string;
     channelName: string;
     token: string;
     partnerId: string;
     partnerName: string;
-    partnerAvatar: string;
-    partnerUniversity?: string;
   } | null>(null);
 
   // Text Chat State
@@ -338,9 +342,14 @@ export const Discover: React.FC = () => {
           },
           body: JSON.stringify({
             userId: currentUser.id,
-            name: currentUser.realName || currentUser.anonymousId || 'Anonymous Student',
-            avatar: currentUser.avatar || '',
-            university: currentUser.university || '',
+            // ANONYMITY: the matchmaking queue carries only the anonymous
+            // label. Real name, avatar photo, and university were previously
+            // sent here and echoed to the matched stranger as partnerName /
+            // partnerAvatar. The server must match on scope/mode (and look
+            // up university server-side from the auth token if it needs it
+            // for CAMPUS matching) and return only the partner's anonymous
+            // label — see the MATCHED handler below.
+            anonymousId: currentUser.anonymousId || 'Anonymous Student',
             mode: modeRef.current,
             scope: scopeRef.current,
             recentPartners: Array.from(recentSkippedPartnersRef.current.keys())
@@ -362,15 +371,16 @@ export const Discover: React.FC = () => {
         } else if (res.ok) {
           const data = await res.json();
           if (data.status === 'MATCHED' && stateRef.current === 'SEARCHING') {
-            console.log('[Matchmaking] Server matched partner:', data.partnerName);
+            // ANONYMITY: the server must return only the partner's anonymous
+            // label in partnerName. If it still echoes a real name/avatar,
+            // that is a server-side leak — this client never sends its own.
+            console.log('[Matchmaking] Server matched partner (anonymous label):', data.partnerName);
             setCallInfo({
               appId: data.appId || '',
               channelName: data.channelName,
               token: data.token || '',
               partnerId: data.partnerId,
               partnerName: data.partnerName,
-              partnerAvatar: data.partnerAvatar,
-              partnerUniversity: data.partnerUniversity
             });
             setIsPartnerDisconnected(false);
             setMessages([]);
@@ -379,12 +389,11 @@ export const Discover: React.FC = () => {
             setState('CONNECTED');
 
             // Peer redundancy broadcast: instantly wake up matched partner if server push is delayed
+            // ANONYMITY: anonymous label only — no real name, avatar, or university.
             safePeerBroadcast({
               targetId: data.partnerId,
               partnerId: currentUser.id,
-              partnerName: currentUser.realName || currentUser.anonymousId || 'Anonymous Student',
-              partnerAvatar: currentUser.avatar || '',
-              partnerUniversity: currentUser.university || '',
+              partnerName: currentUser.anonymousId || 'Anonymous Student',
               channelName: data.channelName,
               appId: data.appId || '',
               token: data.token || '',
@@ -442,15 +451,16 @@ export const Discover: React.FC = () => {
     // Instant Matchmaking Notification (eliminates exponential backoff polling delay)
     newChannel.on('broadcast', { event: 'MATCH_FOUND' }, ({ payload }) => {
       if (payload.targetId === currentUser.id && stateRef.current === 'SEARCHING') {
-        console.log('[Matchmaking] Instant Realtime Match received:', payload.partnerName);
+        // ANONYMITY: payload.partnerName must be the partner's anonymous
+        // label only. Any real name/avatar in this broadcast is a leak from
+        // the sender/server, not something this client sends.
+        console.log('[Matchmaking] Instant Realtime Match received (anonymous label):', payload.partnerName);
         setCallInfo({
           appId: payload.appId || '',
           channelName: payload.channelName,
           token: payload.token || '',
           partnerId: payload.partnerId,
           partnerName: payload.partnerName,
-          partnerAvatar: payload.partnerAvatar || '',
-          partnerUniversity: payload.partnerUniversity || ''
         });
         setIsPartnerDisconnected(false);
         setMessages([]);
@@ -519,11 +529,13 @@ export const Discover: React.FC = () => {
     newChannel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
         isSubscribedRef.current = true;
+        // ANONYMITY: presence is visible to everyone in the discover pool,
+        // so it carries only the anonymous label. No real name, avatar, or
+        // university. (The presence key / routing id is still the opaque
+        // auth UUID — needed to target 1:1 broadcasts — see report.)
         await newChannel.track({
           id: currentUser.id,
-          name: currentUser.realName || currentUser.anonymousId || 'Anonymous Student',
-          avatar: currentUser.avatar,
-          university: currentUser.university,
+          anonymousId: currentUser.anonymousId || 'Anonymous Student',
           status: stateRef.current,
           mode: modeRef.current,
           scope: scopeRef.current
@@ -549,11 +561,10 @@ export const Discover: React.FC = () => {
   // Sync state & mode changes to the realtime pool presence
   useEffect(() => {
     if (channel && currentUser && isSubscribedRef.current) {
+      // ANONYMITY: anonymous label only in presence — see subscribe above.
       channel.track({
         id: currentUser.id,
-        name: currentUser.realName || currentUser.anonymousId || 'Anonymous Student',
-        avatar: currentUser.avatar,
-        university: currentUser.university,
+        anonymousId: currentUser.anonymousId || 'Anonymous Student',
         status: state,
         mode: mode,
         scope: scope
@@ -805,16 +816,13 @@ export const Discover: React.FC = () => {
             >
               <ArrowLeft className="w-4 h-4" />
             </button>
-            <div className="w-9 h-9 rounded-full overflow-hidden border border-neon/50 shrink-0">
-              <img
-                src={callInfo?.partnerAvatar || 'https://via.placeholder.com/150'}
-                alt={callInfo?.partnerName || 'Partner'}
-                className="w-full h-full object-cover"
-              />
+            {/* ANONYMITY: no partner photo is shown pre-match — generic ghost placeholder only. */}
+            <div className="w-9 h-9 rounded-full overflow-hidden border border-neon/50 shrink-0 bg-gradient-to-br from-pink-500/20 to-purple-600/20 flex items-center justify-center text-sm" aria-label="Anonymous partner">
+              👻
             </div>
             <div className="min-w-0">
               <h3 className="font-bold text-sm text-gray-100 truncate">
-                {callInfo?.partnerName || 'Student'}
+                {callInfo?.partnerName || 'Anonymous Student'}
               </h3>
               <p className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -965,7 +973,10 @@ export const Discover: React.FC = () => {
             }, 1000);
           }}
           partnerName={callInfo.partnerName}
-          partnerAvatar={callInfo.partnerAvatar}
+          // ANONYMITY: VideoCall's partnerAvatar prop is required, but no
+          // partner photo is ever supplied — empty string makes it fall back
+          // to its own placeholder. Do not pass a real avatar here.
+          partnerAvatar=""
           callType="video"
           callSessionId="discover_session"
           customControls={
